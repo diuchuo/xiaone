@@ -10,6 +10,9 @@ else
     echo "⚠️ 未检测到 CLOUDFLARE_TOKEN，仅启动本地服务。"
 fi
 
+# 等待几秒确保 tunnel 启动日志输出（可选）
+sleep 2
+
 # 启动主程序 (exec 确保接收信号)
 echo "🚀 启动统一代理服务..."
 exec node unified-server.js
