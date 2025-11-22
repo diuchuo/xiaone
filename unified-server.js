@@ -89,7 +89,7 @@ class AuthSource {
 }
 
 // ===================================================================================
-// 浏览器管理模块
+// 浏览器管理模块 (包含健壮启动逻辑)
 // ===================================================================================
 class BrowserManager {
   constructor(logger, config, authSource) {
@@ -101,7 +101,6 @@ class BrowserManager {
     this.page = null;
     this.currentAuthIndex = 0;
     this.scriptFileName = 'dark-browser.js';
-    this.isReady = false;
 
     if (this.config.browserExecutablePath) {
       this.browserExecutablePath = this.config.browserExecutablePath;
@@ -130,48 +129,63 @@ class BrowserManager {
     } catch (e) { this.logger.error("读取脚本失败"); }
 
     try {
+      // [FIX] 添加关键参数防止 Render 崩溃
       this.browser = await firefox.launch({
         headless: true,
         executablePath: this.browserExecutablePath,
-        args: ['--disable-blink-features=AutomationControlled']
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-dev-shm-usage', // 防止 /dev/shm 内存不足崩溃
+            '--no-sandbox',            // Docker 环境必需
+            '--disable-setuid-sandbox',
+            '--disable-gpu'            // Render 通常没有 GPU
+        ]
       });
 
       this.browser.on('disconnected', () => {
         this.logger.error('❌ [浏览器] 意外断开');
         this.browser = null; this.context = null; this.page = null;
-        this.isReady = false;
       });
 
       this.context = await this.browser.newContext({ storageState, viewport: { width: 1280, height: 720 } });
       this.page = await this.context.newPage();
 
       this.logger.info('[浏览器] 访问 AI Studio...');
-      await this.page.goto('https://aistudio.google.com/u/0/apps/bundled/blank?showAssistant=true&showCode=true', { timeout: 60000, waitUntil: 'networkidle' });
+      // [FIX] 增加超时时间到 120秒
+      await this.page.goto('https://aistudio.google.com/u/0/apps/bundled/blank?showAssistant=true&showCode=true', { timeout: 120000, waitUntil: 'domcontentloaded' });
 
       this.logger.info('[浏览器] 等待页面稳定...');
       await this.page.waitForTimeout(5000);
       try { await this.page.mouse.click(100, 100); } catch(e){}
 
       this.logger.info('[浏览器] 寻找 Code 按钮...');
+      // [FIX] 增加选择器超时时间到 60秒
       const codeButton = this.page.getByRole('button', { name: 'Code' });
-      await codeButton.waitFor({ state: 'visible', timeout: 30000 });
+      try {
+          await codeButton.waitFor({ state: 'visible', timeout: 60000 });
+      } catch (e) {
+          this.logger.warn('[浏览器] 未能立即找到 Code 按钮，尝试直接查找编辑器...');
+      }
       
       const editorContainer = this.page.locator('div.monaco-editor').first();
       let editorVisible = false;
       let clicks = 0;
       
-      while (!editorVisible && clicks < 60) {
+      // [FIX] 增加重试次数
+      while (!editorVisible && clicks < 30) {
         try {
            if (await editorContainer.isVisible()) { editorVisible = true; break; }
-           await codeButton.click({ force: true });
+           if (await codeButton.isVisible()) {
+               await codeButton.click({ force: true });
+           }
            clicks++;
-           await this.page.waitForTimeout(500);
+           await this.page.waitForTimeout(1000);
         } catch (e) {
            await this.page.waitForTimeout(1000);
         }
       }
       
-      if (!editorVisible) throw new Error("无法打开代码编辑器");
+      if (!editorVisible) throw new Error("无法打开代码编辑器 (超时或元素未找到)");
 
       this.logger.info('[浏览器] 注入代理脚本...');
       await this.page.waitForTimeout(2000);
@@ -186,14 +200,12 @@ class BrowserManager {
       await this.page.getByRole('button', { name: 'Preview' }).click();
 
       this.currentAuthIndex = authIndex;
-      this.isReady = true;
       this.logger.info(`✅ [浏览器] 账号 ${authIndex} 就绪`);
 
     } catch (error) {
       this.logger.error(`❌ [浏览器] 启动失败: ${error.message}`);
       if (this.browser) await this.browser.close();
       this.browser = null;
-      this.isReady = false;
       throw error;
     }
   }
@@ -202,7 +214,6 @@ class BrowserManager {
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
-      this.isReady = false;
     }
   }
 
@@ -279,7 +290,7 @@ class ConnectionRegistry extends EventEmitter {
 }
 
 // ===================================================================================
-// 请求处理器
+// 请求处理器 (OpenAI 格式兼容版)
 // ===================================================================================
 class RequestHandler {
   constructor(system, registry, logger, browserMgr) {
@@ -293,17 +304,13 @@ class RequestHandler {
   get config() { return this.system.config; }
 
   async processRequest(req, res) {
+    
     this.system.stats.totalCalls++;
     const currentAuth = this.browserMgr.currentAuthIndex;
     if (!this.system.stats.accountCalls[currentAuth]) this.system.stats.accountCalls[currentAuth] = { total: 0, models: {} };
     this.system.stats.accountCalls[currentAuth].total++;
 
-    // 检查浏览器是否就绪
-    if (!this.browserMgr.isReady) {
-      return res.status(503).json({ error: 'Browser not ready yet, please retry in a moment' });
-    }
-
-    if (!this.registry.hasActive()) return res.status(503).send('No browser connected');
+    if (!this.registry.hasActive()) return res.status(503).send('No browser connected (Initializing...)');
 
     const requestId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const queue = this.registry.createQueue(requestId);
@@ -383,18 +390,18 @@ class RequestHandler {
   }
 
   async _handleRealStream(proxyReq, queue, res) {
-    try {
-      this._forward(proxyReq);
-      const head = await queue.dequeue();
-      if (head.event_type === 'error') throw new Error(head.message);
-      res.status(head.status || 200);
-      if (head.headers) Object.entries(head.headers).forEach(([k, v]) => { if (k !== 'content-length') res.set(k, v); });
-      
-      res.set('Content-Type', 'text/event-stream');
-      res.set('Cache-Control', 'no-cache');
-      res.set('Connection', 'keep-alive');
-      
-      this.failureCount = 0;
+  try {
+    this._forward(proxyReq);
+    const head = await queue.dequeue();
+    if (head.event_type === 'error') throw new Error(head.message);
+    res.status(head.status || 200);
+    if (head.headers) Object.entries(head.headers).forEach(([k, v]) => { if (k !== 'content-length') res.set(k, v); });
+    
+    res.set('Content-Type', 'text/event-stream');
+    res.set('Cache-Control', 'no-cache');
+    res.set('Connection', 'keep-alive');
+    
+    this.failureCount = 0;
       while (true) {
         const msg = await queue.dequeue(30000);
         if (msg.type === 'STREAM_END') break;
@@ -410,7 +417,7 @@ class RequestHandler {
     this.logger.error(e.message);
     this.failureCount++;
     if (this.config.failureThreshold > 0 && this.failureCount >= this.config.failureThreshold) {
-      this.logger.warn('达到失败阈值,切换账号...');
+      this.logger.warn('达到失败阈值，切换账号...');
       try {
         await this.browserMgr.switchAccount(this._getNextAuthIndex());
         this.failureCount = 0;
@@ -432,7 +439,7 @@ class RequestHandler {
 }
 
 // ===================================================================================
-// 系统主类
+// 系统主类 (包含被恢复的 Auth 和 仪表盘功能)
 // ===================================================================================
 class ProxyServerSystem extends EventEmitter {
   constructor() {
@@ -462,13 +469,17 @@ class ProxyServerSystem extends EventEmitter {
     if (process.env.PORT) conf.httpPort = parseInt(process.env.PORT);
     if (process.env.HOST) conf.host = process.env.HOST;
     if (process.env.STREAMING_MODE) conf.streamingMode = process.env.STREAMING_MODE;
+    
     if (process.env.FAILURE_THRESHOLD) conf.failureThreshold = parseInt(process.env.FAILURE_THRESHOLD);
     if (process.env.MAX_RETRIES) conf.maxRetries = parseInt(process.env.MAX_RETRIES);
     if (process.env.RETRY_DELAY) conf.retryDelay = parseInt(process.env.RETRY_DELAY);
+    
     if (process.env.DEBUG_MODE) conf.debugMode = (process.env.DEBUG_MODE === 'true');
     if (process.env.INITIAL_AUTH_INDEX) conf.initialAuthIndex = parseInt(process.env.INITIAL_AUTH_INDEX);
     if (process.env.CAMOUFOX_EXECUTABLE_PATH) conf.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
+
     if (process.env.API_KEYS) conf.apiKeys = process.env.API_KEYS.split(',').map(k => k.trim()).filter(Boolean);
+    
     if (process.env.IMMEDIATE_SWITCH_STATUS_CODES) {
         conf.immediateSwitchStatusCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES
             .split(',').map(c => parseInt(c)).filter(c => !isNaN(c));
@@ -488,7 +499,7 @@ class ProxyServerSystem extends EventEmitter {
       }
 
       if (clientKey && keys.includes(clientKey)) {
-        if (req.query.key) delete req.query.key;
+        if (req.query.key) delete req.query.key; 
         return next();
       }
       
@@ -498,7 +509,6 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   async start() {
-    // ✅ 关键修改：先启动 HTTP 服务器，再启动浏览器
     const app = express();
     app.use(express.json({ limit: '50mb' }));
     app.use(express.raw({ type: '*/*', limit: '50mb' }));
@@ -526,7 +536,7 @@ class ProxyServerSystem extends EventEmitter {
     apiRouter.use(dashboardAuth);
     apiRouter.get('/data', (req, res) => {
       res.json({
-        status: { uptime: process.uptime(), connected: !!this.browserMgr.browser, streamingMode: this.streamingMode, browserReady: this.browserMgr.isReady },
+        status: { uptime: process.uptime(), connected: !!this.browserMgr.browser, streamingMode: this.streamingMode },
         auth: { currentAuthIndex: this.browserMgr.currentAuthIndex, accounts: this.authSource.getAccountDetails() },
         stats: this.stats,
         config: this.config
@@ -547,25 +557,27 @@ class ProxyServerSystem extends EventEmitter {
     });
     
     app.use('/dashboard', apiRouter);
+
     app.use(this._createAuthMiddleware());
     app.all('*', (req, res) => {
       if (req.path.startsWith('/dashboard')) return;
       this.handler.processRequest(req, res);
     });
 
-    // ✅ 先启动 HTTP 和 WebSocket 服务器
-    this.httpServer = http.createServer(app).listen(this.config.httpPort, this.config.host);
+    // [FIX] 改变启动顺序：先监听端口，再启动浏览器
+    // 这样 Render 可以在 60秒内检测到端口打开，防止部署失败
+    this.httpServer = http.createServer(app).listen(this.config.httpPort, this.config.host, () => {
+        this.logger.info(`✅ HTTP 服务器已启动: http://${this.config.host}:${this.config.httpPort}`);
+        
+        // 异步启动浏览器
+        const index = this.config.initialAuthIndex || this.authSource.getFirstAvailableIndex();
+        this.browserMgr.launchBrowser(index).catch(err => {
+            this.logger.error(`浏览器启动严重失败: ${err.message}`);
+        });
+    });
+
     this.wsServer = new WebSocket.Server({ port: this.config.wsPort, host: this.config.host });
     this.wsServer.on('connection', (ws, req) => this.registry.addConnection(ws, { address: req.socket.remoteAddress }));
-
-    this.logger.info(`✅ HTTP 服务器已启动: http://${this.config.host}:${this.config.httpPort}`);
-    this.logger.info(`✅ WebSocket 服务器已启动: ws://${this.config.host}:${this.config.wsPort}`);
-
-    // ✅ 后台异步启动浏览器，不阻塞主流程
-    const index = this.config.initialAuthIndex || this.authSource.getFirstAvailableIndex();
-    this.browserMgr.launchBrowser(index).catch(err => {
-      this.logger.error(`浏览器启动失败，但服务器继续运行: ${err.message}`);
-    });
   }
 
   _getDashboardHtml() {
@@ -644,11 +656,10 @@ class ProxyServerSystem extends EventEmitter {
             const res = await fetch('/dashboard/data', {headers: getHeaders()});
             if(res.status === 401) return location.reload();
             const data = await res.json();
-      const browserStatus = data.status.browserReady ? '✅ 就绪' : (data.status.connected ? '⚠️ 启动中' : '❌ 断开');
             
             document.getElementById('status').innerHTML = 
               '运行时间: ' + Math.floor(data.status.uptime) + 's<br>' +
-              '浏览器: ' + browserStatus + '<br>' +
+              '浏览器: ' + (data.status.connected ? '✅ 已连接' : '⚠️ 初始化中...') + '<br>' +
               '当前账号: ' + data.auth.currentAuthIndex + '<br>' + 
               '总调用: ' + data.stats.totalCalls;
             
@@ -675,20 +686,11 @@ class ProxyServerSystem extends EventEmitter {
         refresh();
       }
 
-      // 自动尝试登录
       if(currentKey) verifyKey();
     </script>
     </body></html>`;
   }
 }
 
-// 主程序入口
-if (require.main === module) {
-  const system = new ProxyServerSystem();
-  system.start().catch(err => {
-    console.error('系统启动失败:', err);
-    process.exit(1);
-  });
-}
-
+if (require.main === module) new ProxyServerSystem().start();
 module.exports = { ProxyServerSystem };
