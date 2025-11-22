@@ -375,15 +375,20 @@ class RequestHandler {
   }
 
   async _handleRealStream(proxyReq, queue, res) {
-    try {
-      this._forward(proxyReq);
-      const head = await queue.dequeue();
-      if (head.event_type === 'error') throw new Error(head.message);
+  try {
+    this._forward(proxyReq);
+    const head = await queue.dequeue();
+    if (head.event_type === 'error') throw new Error(head.message);
+    res.status(head.status || 200);
+    if (head.headers) Object.entries(head.headers).forEach(([k, v]) => { if (k !== 'content-length') res.set(k, v); });
+    
+    // 【核心修复】强制设置正确的流式响应 Content-Type
+    res.set('Content-Type', 'text/event-stream');
+    res.set('Cache-Control', 'no-cache');
+    res.set('Connection', 'keep-alive');
+    
+    this.failureCount = 0;
 
-      res.status(head.status || 200);
-      if (head.headers) Object.entries(head.headers).forEach(([k, v]) => { if (k !== 'content-length') res.set(k, v); });
-
-      this.failureCount = 0;
       while (true) {
         const msg = await queue.dequeue(30000);
         if (msg.type === 'STREAM_END') break;
@@ -683,4 +688,5 @@ class ProxyServerSystem extends EventEmitter {
 
 if (require.main === module) new ProxyServerSystem().start();
 module.exports = { ProxyServerSystem };
+
 
