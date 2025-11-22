@@ -112,11 +112,15 @@ class BrowserManager {
   }
 
   async launchBrowser(authIndex) {
+    // 如果已有浏览器实例，先不重复启动，除非强制重连逻辑（此处简化）
     if (this.browser) return;
 
     this.logger.info(`🚀 [浏览器] 启动中 (账号 #${authIndex})...`);
     const storageState = this.authSource.getAuth(authIndex);
-    if (!storageState) throw new Error(`无法加载账号 ${authIndex}`);
+    if (!storageState) {
+        this.logger.error(`❌ 无法加载账号 ${authIndex} 的认证信息`);
+        return; // 不抛出致命错误，防止服务器崩溃
+    }
 
     if (storageState.cookies) {
       storageState.cookies.forEach(c => { if (!['Lax', 'Strict', 'None'].includes(c.sameSite)) c.sameSite = 'None'; });
@@ -129,10 +133,17 @@ class BrowserManager {
     } catch (e) { this.logger.error("读取脚本失败"); }
 
     try {
+      // [修复2] 增加 Render/Docker 环境适配参数
       this.browser = await firefox.launch({
         headless: true,
         executablePath: this.browserExecutablePath,
-        args: ['--disable-blink-features=AutomationControlled']
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-dev-shm-usage', // [重要] 防止 Docker 共享内存崩溃
+            '--no-sandbox',            // [重要] 容器环境必备
+            '--disable-setuid-sandbox',
+            '--disable-gpu'            // 节省资源
+        ]
       });
 
       this.browser.on('disconnected', () => {
@@ -140,30 +151,45 @@ class BrowserManager {
         this.browser = null; this.context = null; this.page = null;
       });
 
-      this.context = await this.browser.newContext({ storageState, viewport: { width: 1280, height: 720 } });
+      // [优化] 减小视口以节省内存
+      this.context = await this.browser.newContext({ 
+          storageState, 
+          viewport: { width: 1024, height: 768 },
+          deviceScaleFactor: 1
+      });
+      
       this.page = await this.context.newPage();
 
+      // [优化] 拦截图片和字体，加快加载速度并节省带宽
+      await this.page.route('**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}', route => route.abort());
+
       this.logger.info('[浏览器] 访问 AI Studio...');
-      await this.page.goto('https://aistudio.google.com/u/0/apps/bundled/blank?showAssistant=true&showCode=true', { timeout: 60000, waitUntil: 'networkidle' });
+      // [修复3] 增加超时时间至 120秒
+      await this.page.goto('https://aistudio.google.com/u/0/apps/bundled/blank?showAssistant=true&showCode=true', { 
+          timeout: 120000, 
+          waitUntil: 'domcontentloaded' // 改为 domcontentloaded 比 networkidle 更快
+      });
 
       this.logger.info('[浏览器] 等待页面稳定...');
-      await this.page.waitForTimeout(5000);
-      try { await this.page.mouse.click(100, 100); } catch(e){}
+      // 这里的等待其实可以适当缩短，或者依赖后续的 locator 等待
+      await this.page.waitForTimeout(3000);
 
       this.logger.info('[浏览器] 寻找 Code 按钮...');
       const codeButton = this.page.getByRole('button', { name: 'Code' });
-      await codeButton.waitFor({ state: 'visible', timeout: 30000 });
+      // [修复3] 增加寻找按钮的超时时间
+      await codeButton.waitFor({ state: 'visible', timeout: 60000 });
       
       const editorContainer = this.page.locator('div.monaco-editor').first();
       let editorVisible = false;
       let clicks = 0;
       
+      // 稍微增加重试次数和间隔
       while (!editorVisible && clicks < 60) {
         try {
            if (await editorContainer.isVisible()) { editorVisible = true; break; }
            await codeButton.click({ force: true });
            clicks++;
-           await this.page.waitForTimeout(500);
+           await this.page.waitForTimeout(1000);
         } catch (e) {
            await this.page.waitForTimeout(1000);
         }
@@ -188,9 +214,11 @@ class BrowserManager {
 
     } catch (error) {
       this.logger.error(`❌ [浏览器] 启动失败: ${error.message}`);
-      if (this.browser) await this.browser.close();
+      if (this.browser) {
+          try { await this.browser.close(); } catch(e) {}
+      }
       this.browser = null;
-      throw error;
+      // 不要在这里 throw error，否则会再次导致主进程退出
     }
   }
 
@@ -288,14 +316,12 @@ class RequestHandler {
   get config() { return this.system.config; }
 
   async processRequest(req, res) {
-    // 注意：鉴权现在由中间件统一处理，这里不需要再删 key
-    
     this.system.stats.totalCalls++;
     const currentAuth = this.browserMgr.currentAuthIndex;
     if (!this.system.stats.accountCalls[currentAuth]) this.system.stats.accountCalls[currentAuth] = { total: 0, models: {} };
     this.system.stats.accountCalls[currentAuth].total++;
 
-    if (!this.registry.hasActive()) return res.status(503).send('No browser connected');
+    if (!this.registry.hasActive()) return res.status(503).send('No browser connected / Browser still loading');
 
     const requestId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const queue = this.registry.createQueue(requestId);
@@ -382,7 +408,6 @@ class RequestHandler {
     res.status(head.status || 200);
     if (head.headers) Object.entries(head.headers).forEach(([k, v]) => { if (k !== 'content-length') res.set(k, v); });
     
-    // 【核心修复】强制设置正确的流式响应 Content-Type
     res.set('Content-Type', 'text/event-stream');
     res.set('Cache-Control', 'no-cache');
     res.set('Connection', 'keep-alive');
@@ -425,7 +450,7 @@ class RequestHandler {
 }
 
 // ===================================================================================
-// 系统主类 (包含被恢复的 Auth 和 仪表盘功能)
+// 系统主类
 // ===================================================================================
 class ProxyServerSystem extends EventEmitter {
   constructor() {
@@ -442,19 +467,16 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   _loadConfig() {
-    // 1. 默认配置
     let conf = {
       httpPort: 8889, host: '0.0.0.0', wsPort: 9998, streamingMode: 'real',
       failureThreshold: 0, maxRetries: 3, retryDelay: 2000, apiKeys: [], 
       debugMode: false, browserExecutablePath: null, immediateSwitchStatusCodes: []
     };
 
-    // 2. 加载 config.json (如果存在)
     try {
       if (fs.existsSync('config.json')) Object.assign(conf, JSON.parse(fs.readFileSync('config.json')));
     } catch (e) {}
 
-    // 3. 加载环境变量 (覆盖 config.json) - 恢复丢失的逻辑
     if (process.env.PORT) conf.httpPort = parseInt(process.env.PORT);
     if (process.env.HOST) conf.host = process.env.HOST;
     if (process.env.STREAMING_MODE) conf.streamingMode = process.env.STREAMING_MODE;
@@ -478,20 +500,18 @@ class ProxyServerSystem extends EventEmitter {
   }
 
 
-  // ✅ 恢复的核心鉴权中间件
   _createAuthMiddleware() {
     return (req, res, next) => {
       const keys = this.config.apiKeys;
       if (!keys || keys.length === 0) return next();
 
-      // 支持多种传参方式: query param, x-goog-api-key, Authorization Bearer
       let clientKey = req.query.key || req.headers['x-goog-api-key'] || req.headers['x-api-key'];
       if (!clientKey && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
         clientKey = req.headers.authorization.substring(7);
       }
 
       if (clientKey && keys.includes(clientKey)) {
-        if (req.query.key) delete req.query.key; // 隐藏 key
+        if (req.query.key) delete req.query.key;
         return next();
       }
       
@@ -501,18 +521,14 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   async start() {
-    const index = this.config.initialAuthIndex || this.authSource.getFirstAvailableIndex();
-    await this.browserMgr.launchBrowser(index);
-
+    // [修复1] 先启动 HTTP 服务，确保 Render 健康检查通过
     const app = express();
     app.use(express.json({ limit: '50mb' }));
     app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
-    // ✅ 恢复：仪表盘重定向
     app.get('/', (req, res) => res.redirect('/dashboard'));
     app.get('/dashboard', (req, res) => res.send(this._getDashboardHtml()));
     
-    // ✅ 恢复：仪表盘 API 验证
     app.post('/dashboard/verify-key', (req, res) => {
         const { key } = req.body;
         if (!this.config.apiKeys.length || this.config.apiKeys.includes(key)) {
@@ -521,7 +537,6 @@ class ProxyServerSystem extends EventEmitter {
         res.status(401).json({ success: false });
     });
 
-    // ✅ 恢复：仪表盘 API 保护中间件
     const dashboardAuth = (req, res, next) => {
         const key = req.headers['x-dashboard-auth'];
         if (!this.config.apiKeys.length || (key && this.config.apiKeys.includes(key))) {
@@ -554,24 +569,32 @@ class ProxyServerSystem extends EventEmitter {
         res.json({success: true});
     });
     
-    // 挂载仪表盘路由
     app.use('/dashboard', apiRouter);
 
-    // ✅ 恢复：主代理路由鉴权
     app.use(this._createAuthMiddleware());
     app.all('*', (req, res) => {
-      if (req.path.startsWith('/dashboard')) return; // 防止意外匹配
+      if (req.path.startsWith('/dashboard')) return;
       this.handler.processRequest(req, res);
     });
 
-    this.httpServer = http.createServer(app).listen(this.config.httpPort, this.config.host);
+    // 启动监听
+    this.httpServer = http.createServer(app).listen(this.config.httpPort, this.config.host, () => {
+        this.logger.info(`HTTP Server 启动监听: http://${this.config.host}:${this.config.httpPort}`);
+    });
     this.wsServer = new WebSocket.Server({ port: this.config.wsPort, host: this.config.host });
     this.wsServer.on('connection', (ws, req) => this.registry.addConnection(ws, { address: req.socket.remoteAddress }));
 
-    this.logger.info(`系统启动完成: http://${this.config.host}:${this.config.httpPort}`);
+    // [修复1] 异步启动浏览器，不阻塞 HTTP 服务启动
+    const index = this.config.initialAuthIndex || this.authSource.getFirstAvailableIndex();
+    
+    // 使用 setImmediate 确保在下一帧执行，完全不阻塞当前调用栈
+    setImmediate(() => {
+        this.browserMgr.launchBrowser(index).catch(e => {
+            this.logger.error(`初始化浏览器失败: ${e.message}`);
+        });
+    });
   }
 
-  // ✅ 恢复：完整的仪表盘 HTML 和 登录逻辑
   _getDashboardHtml() {
     return `<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><title>Proxy Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -651,7 +674,7 @@ class ProxyServerSystem extends EventEmitter {
             
             document.getElementById('status').innerHTML = 
               '运行时间: ' + Math.floor(data.status.uptime) + 's<br>' +
-              '浏览器: ' + (data.status.connected ? '✅ 已连接' : '❌ 断开') + '<br>' +
+              '浏览器: ' + (data.status.connected ? '✅ 已连接' : '⏳ 启动中/断开') + '<br>' +
               '当前账号: ' + data.auth.currentAuthIndex + '<br>' + 
               '总调用: ' + data.stats.totalCalls;
             
@@ -678,7 +701,6 @@ class ProxyServerSystem extends EventEmitter {
         refresh();
       }
 
-      // 自动尝试登录
       if(currentKey) verifyKey();
     </script>
     </body></html>`;
@@ -687,6 +709,3 @@ class ProxyServerSystem extends EventEmitter {
 
 if (require.main === module) new ProxyServerSystem().start();
 module.exports = { ProxyServerSystem };
-
-
-
