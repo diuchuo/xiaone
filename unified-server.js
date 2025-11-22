@@ -89,7 +89,7 @@ class AuthSource {
 }
 
 // ===================================================================================
-// 浏览器管理模块 (包含健壮启动逻辑)
+// 浏览器管理模块 (包含健壮启动逻辑与内存优化)
 // ===================================================================================
 class BrowserManager {
   constructor(logger, config, authSource) {
@@ -114,7 +114,7 @@ class BrowserManager {
   async launchBrowser(authIndex) {
     if (this.browser) return;
 
-    this.logger.info(`🚀 [浏览器] 启动中 (账号 #${authIndex})...`);
+    this.logger.info(`🚀 [浏览器] 启动中 (账号 #${authIndex}) - 内存优化模式`);
     const storageState = this.authSource.getAuth(authIndex);
     if (!storageState) throw new Error(`无法加载账号 ${authIndex}`);
 
@@ -129,7 +129,7 @@ class BrowserManager {
     } catch (e) { this.logger.error("读取脚本失败"); }
 
     try {
-      // [FIX] 添加关键参数防止 Render 崩溃
+      // [FIX] 极限内存优化参数
       this.browser = await firefox.launch({
         headless: true,
         executablePath: this.browserExecutablePath,
@@ -138,7 +138,17 @@ class BrowserManager {
             '--disable-dev-shm-usage', // 防止 /dev/shm 内存不足崩溃
             '--no-sandbox',            // Docker 环境必需
             '--disable-setuid-sandbox',
-            '--disable-gpu'            // Render 通常没有 GPU
+            '--disable-gpu',           // 禁用 GPU 加速节省内存
+            '--disable-software-rasterizer',
+            '--disable-extensions',    // 禁用扩展
+            '--no-first-run',
+            '--no-service-autorun',
+            '--password-store=basic',
+            '--disable-background-networking', // 禁止后台网络活动
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--mute-audio'             // 静音，减少音频子系统开销
         ]
       });
 
@@ -147,15 +157,31 @@ class BrowserManager {
         this.browser = null; this.context = null; this.page = null;
       });
 
-      this.context = await this.browser.newContext({ storageState, viewport: { width: 1280, height: 720 } });
+      // 减小视窗尺寸以降低渲染开销，但保持足够的宽度以防 UI 折叠
+      this.context = await this.browser.newContext({ 
+          storageState, 
+          viewport: { width: 1024, height: 768 },
+          deviceScaleFactor: 1 
+      });
+      
       this.page = await this.context.newPage();
 
-      this.logger.info('[浏览器] 访问 AI Studio...');
+      // [FIX] 资源拦截：这是节省内存最关键的一步
+      // 拦截图片、字体和媒体，仅允许脚本、样式和文档
+      await this.page.route('**/*', route => {
+        const type = route.request().resourceType();
+        if (['image', 'media', 'font', 'object', 'beacon', 'csp_report', 'imageset'].includes(type)) {
+            return route.abort();
+        }
+        return route.continue();
+      });
+
+      this.logger.info('[浏览器] 访问 AI Studio (已开启资源阻断)...');
       // [FIX] 增加超时时间到 120秒
       await this.page.goto('https://aistudio.google.com/u/0/apps/bundled/blank?showAssistant=true&showCode=true', { timeout: 120000, waitUntil: 'domcontentloaded' });
 
       this.logger.info('[浏览器] 等待页面稳定...');
-      await this.page.waitForTimeout(5000);
+      await this.page.waitForTimeout(5000); // 稍微等待一下 DOM 建立
       try { await this.page.mouse.click(100, 100); } catch(e){}
 
       this.logger.info('[浏览器] 寻找 Code 按钮...');
@@ -204,7 +230,10 @@ class BrowserManager {
 
     } catch (error) {
       this.logger.error(`❌ [浏览器] 启动失败: ${error.message}`);
-      if (this.browser) await this.browser.close();
+      // 确保出错时彻底关闭，防止僵尸进程占用内存
+      if (this.browser) {
+          await this.browser.close().catch(() => {});
+      }
       this.browser = null;
       throw error;
     }
@@ -214,6 +243,10 @@ class BrowserManager {
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
+      this.context = null;
+      this.page = null;
+      // 强制手动垃圾回收建议 (Node环境)
+      if (global.gc) { global.gc(); }
     }
   }
 
