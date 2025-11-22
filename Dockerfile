@@ -1,11 +1,9 @@
 FROM node:18-slim
 
-# 安装必要的系统依赖（用于camoufox浏览器）
-# 使用 --no-install-recommends 减小体积
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 1. 安装系统依赖 (包含 camoufox 依赖和 wget)
+RUN apt-get update && apt-get install -y \
     wget \
-    unzip \
-    ca-certificates \
+    curl \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -25,8 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxss1 \
     libxtst6 \
     xvfb \
-    dumb-init \
     && rm -rf /var/lib/apt/lists/*
+
+# 2. 安装 Cloudflare Tunnel (cloudflared)
+RUN wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared && \
+    chmod +x /usr/local/bin/cloudflared
 
 # 创建用户目录
 RUN useradd -m -s /bin/bash user
@@ -39,12 +40,16 @@ RUN npm install
 # 复制应用文件
 COPY unified-server.js dark-browser.js ./
 COPY auth/ ./auth/
-# 注意：确保本地有这个文件夹，或者通过 build 步骤下载
 COPY camoufox-linux/ ./camoufox-linux/
 
-# 设置文件权限
+# 3. 复制启动脚本
+COPY start.sh ./
+
+# 设置权限 & 修复 Windows 换行符问题 (关键步骤)
 RUN chown -R user:user /home/user && \
-    chmod +x /home/user/camoufox-linux/camoufox
+    chmod +x /home/user/camoufox-linux/camoufox && \
+    chmod +x /home/user/start.sh && \
+    sed -i 's/\r$//' /home/user/start.sh
 
 # 切换到user用户
 USER user
@@ -52,8 +57,5 @@ USER user
 # 暴露端口
 EXPOSE 8889
 
-# 使用 dumb-init 作为入口点，处理信号转发
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-
-# 启动命令
-CMD ["node", "unified-server.js"]
+# 4. 启动命令指向脚本
+CMD ["./start.sh"]
