@@ -1,6 +1,7 @@
 FROM node:18-slim
 
 # 1. 安装系统依赖 (包含 camoufox 依赖和 wget)
+# 移除非必要的 lib 可能会导致 camoufox 无法启动，所以保留原样
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
@@ -45,7 +46,7 @@ COPY camoufox-linux/ ./camoufox-linux/
 # 3. 复制启动脚本
 COPY start.sh ./
 
-# 设置权限 & 修复 Windows 换行符问题 (关键步骤)
+# 设置权限 & 修复 Windows 换行符问题
 RUN chown -R user:user /home/user && \
     chmod +x /home/user/camoufox-linux/camoufox && \
     chmod +x /home/user/start.sh && \
@@ -53,6 +54,12 @@ RUN chown -R user:user /home/user && \
 
 # 切换到user用户
 USER user
+
+# [关键优化] 限制 Node.js 堆内存为 128MB
+# Render 的免费实例只有 512MB，Node 默认可能占用过多，
+# 我们将 Node 限制得很小，把剩余内存留给 Camoufox 浏览器。
+ENV NODE_OPTIONS="--max-old-space-size=128"
+ENV FORCE_COLOR=1
 
 # 暴露端口
 EXPOSE 8889
